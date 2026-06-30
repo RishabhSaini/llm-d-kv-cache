@@ -142,7 +142,7 @@ func New(ctx context.Context, config PrecisePrefixCachePluginConfig) (*PrecisePr
 	if config.KVEventsConfig.ZMQEndpoint != "" {
 		// setup local subscriber to support global socket mode
 		if err := subscribersManager.EnsureSubscriber(ctx, "local-subscriber",
-			config.KVEventsConfig.ZMQEndpoint, config.KVEventsConfig.TopicFilter,
+			config.KVEventsConfig.ZMQEndpoint, "", config.KVEventsConfig.TopicFilter,
 			false); err != nil {
 			return nil, fmt.Errorf("failed to create local subscriber for global socket mode: %w", err)
 		}
@@ -205,6 +205,7 @@ func (s *PrecisePrefixCacheScorer) Score(ctx context.Context, cycleState *types.
 
 			if err := s.subscribersManager.EnsureSubscriber(context.Background(), podKey, // dont use request ctx
 				fmt.Sprintf("tcp://%s:%d", podObj.Address, s.kvEventsConfig.PodDiscoveryConfig.SocketPort),
+				"",
 				s.kvEventsConfig.TopicFilter,
 				true); err != nil {
 				logger.Error(err, "Failed to ensure KV-events subscriber for pod", "pod", podKey,

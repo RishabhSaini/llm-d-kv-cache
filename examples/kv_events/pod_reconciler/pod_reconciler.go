@@ -124,7 +124,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		"podIP", pod.Status.PodIP)
 
 	if err := r.SubscriberManager.EnsureSubscriber(ctx, podIdentifier, endpoint,
-		r.Config.TopicFilter, true); err != nil {
+		"", r.Config.TopicFilter, true); err != nil {
 		debugLogger.Error(err, "Failed to ensure subscriber for pod", "pod", req)
 		return ctrl.Result{}, err
 	}

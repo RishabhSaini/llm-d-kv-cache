@@ -26,25 +26,33 @@ import (
 )
 
 const (
-	// How long to wait before retrying to connect.
-	retryInterval = 5 * time.Second
+	retryInterval       = 5 * time.Second
+	replaySocketTimeout = 10 * time.Second
+	replayCooldown      = 30 * time.Second
 )
 
 // zmqSubscriber connects to a ZMQ publisher and forwards messages to a pool.
 type zmqSubscriber struct {
-	pool        *Pool
-	endpoint    string
-	remote      bool
-	topicFilter string
+	pool           *Pool
+	endpoint       string
+	replayEndpoint string
+	remote         bool
+	topicFilter    string
+
+	// Replay state — persists across reconnections within subscriber lifetime.
+	lastSeq           uint64
+	hasLastSeq        bool
+	lastReplayFailure time.Time
 }
 
 // newZMQSubscriber creates a new ZMQ subscriber.
-func newZMQSubscriber(pool *Pool, endpoint, topicFilter string, remote bool) *zmqSubscriber {
+func newZMQSubscriber(pool *Pool, endpoint, replayEndpoint, topicFilter string, remote bool) *zmqSubscriber {
 	return &zmqSubscriber{
-		pool:        pool,
-		endpoint:    endpoint,
-		remote:      remote,
-		topicFilter: topicFilter,
+		pool:           pool,
+		endpoint:       endpoint,
+		replayEndpoint: replayEndpoint,
+		remote:         remote,
+		topicFilter:    topicFilter,
 	}
 }
 
@@ -107,6 +115,14 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 		return
 	}
 
+	// Proactive replay on connect: rebuild the index from buffered events
+	// without waiting for a live event to arrive.
+	if z.replayEndpoint != "" && !z.hasLastSeq {
+		logger.Info("Requesting proactive replay on connect",
+			"endpoint", z.endpoint, "replayEndpoint", z.replayEndpoint)
+		z.requestReplay(ctx, 0)
+	}
+
 	debugLogger := logger.V(logging.DEBUG)
 
 	for {
@@ -133,6 +149,22 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 		}
 		seq := binary.BigEndian.Uint64(seqBytes)
 
+		// Gap detection: request replay for missed events.
+		// Cooldown only applies after a failed replay to avoid blocking on unreachable endpoints.
+		if z.replayEndpoint != "" && (z.lastReplayFailure.IsZero() || time.Since(z.lastReplayFailure) >= replayCooldown) {
+			if z.hasLastSeq && seq > z.lastSeq+1 {
+				missed := seq - z.lastSeq - 1
+				logger.Info("Detected gap in event sequence, requesting replay",
+					"lastSeq", z.lastSeq, "currentSeq", seq, "missed", missed,
+					"endpoint", z.endpoint)
+				z.requestReplay(ctx, z.lastSeq+1)
+			} else if !z.hasLastSeq && seq > 0 {
+				logger.Info("Joining mid-stream, requesting full replay",
+					"currentSeq", seq, "endpoint", z.endpoint)
+				z.requestReplay(ctx, 0)
+			}
+		}
+
 		debugLogger.V(logging.TRACE).Info("Received message from zmq subscriber",
 			"topic", topic,
 			"seq", seq,
@@ -143,5 +175,107 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			Sequence: seq,
 			Payload:  payload,
 		})
+
+		if !z.hasLastSeq || seq > z.lastSeq {
+			z.lastSeq = seq
+			z.hasLastSeq = true
+		}
 	}
+}
+
+// requestReplay connects to the vLLM ROUTER socket via a DEALER and requests
+// all buffered events starting from startSeq. Replayed events are fed into
+// the pool via AddTask, identical to live events.
+func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) {
+	logger := log.FromContext(ctx).WithName("zmq-replay")
+
+	dealer := zmq4.NewDealer(ctx, zmq4.WithTimeout(replaySocketTimeout))
+	defer dealer.Close()
+
+	if err := dealer.Dial(z.replayEndpoint); err != nil {
+		z.lastReplayFailure = time.Now()
+
+		logger.Error(err, "Failed to connect replay socket",
+			"replayEndpoint", z.replayEndpoint)
+		return
+	}
+
+	// DEALER must prepend an empty delimiter so the ROUTER sees
+	// [client_id, empty, startSeq] — matching the REQ envelope format.
+	seqBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(seqBytes, startSeq)
+	if err := dealer.SendMulti(zmq4.NewMsgFrom([]byte{}, seqBytes)); err != nil {
+		z.lastReplayFailure = time.Now()
+
+		logger.Error(err, "Failed to send replay request",
+			"startSeq", startSeq, "replayEndpoint", z.replayEndpoint)
+		return
+	}
+
+	replayed := 0
+	for {
+		select {
+		case <-ctx.Done():
+			z.lastReplayFailure = time.Now()
+
+			logger.Info("Replay timed out",
+				"replayed", replayed, "replayEndpoint", z.replayEndpoint)
+			return
+		default:
+		}
+
+		msg, err := dealer.Recv()
+		if err != nil {
+			z.lastReplayFailure = time.Now()
+
+			logger.Error(err, "Failed to receive replay message",
+				"replayed", replayed, "replayEndpoint", z.replayEndpoint)
+			return
+		}
+
+		frames := msg.Frames
+		// DEALER receives [empty_delim, topic, seq, payload].
+		// Strip the leading empty delimiter to get [topic, seq, payload].
+		if len(frames) > 0 && len(frames[0]) == 0 {
+			frames = frames[1:]
+		}
+
+		if len(frames) != 3 {
+			logger.Error(nil, "Unexpected replay frame count",
+				"got", len(frames), "want", 3, "replayed", replayed)
+			break
+		}
+		if len(frames[2]) == 0 {
+			break
+		}
+
+		replayTopic := string(frames[0])
+		replaySeqBytes := frames[1]
+		replayPayload := frames[2]
+
+		if len(replaySeqBytes) < 8 {
+			logger.Error(nil, "Replay sequence frame too short",
+				"got", len(replaySeqBytes), "replayed", replayed)
+			break
+		}
+
+		replaySeq := binary.BigEndian.Uint64(replaySeqBytes)
+
+		z.pool.AddTask(&RawMessage{
+			Topic:    replayTopic,
+			Sequence: replaySeq,
+			Payload:  replayPayload,
+		})
+
+		if replaySeq > z.lastSeq || !z.hasLastSeq {
+			z.lastSeq = replaySeq
+			z.hasLastSeq = true
+		}
+
+		replayed++
+	}
+
+	logger.Info("Replay complete",
+		"replayed", replayed, "startSeq", startSeq,
+		"replayEndpoint", z.replayEndpoint)
 }

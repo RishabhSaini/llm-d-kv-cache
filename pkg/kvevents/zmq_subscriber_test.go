@@ -19,7 +19,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -126,7 +128,7 @@ func TestZMQSubscriber_ReceivesMessages(t *testing.T) {
 	// Start subscriber — remote=false means it binds (Listen).
 	endpoint := "tcp://127.0.0.1:15559"
 	subManager := kvevents.NewSubscriberManager(pool)
-	err = subManager.EnsureSubscriber(ctx, "test-pod", endpoint, "kv@", false)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", endpoint, "", "kv@", false)
 	require.NoError(t, err)
 
 	// Give subscriber time to bind.
@@ -174,7 +176,7 @@ func TestZMQSubscriber_ShortSequenceFrameSkipped(t *testing.T) {
 	endpoint := fmt.Sprintf("tcp://%s", ln.Addr().String())
 	ln.Close()
 	subManager := kvevents.NewSubscriberManager(pool)
-	err = subManager.EnsureSubscriber(ctx, "test-pod", endpoint, "kv@", false)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", endpoint, "", "kv@", false)
 	require.NoError(t, err)
 	time.Sleep(100 * time.Millisecond)
 
@@ -199,5 +201,309 @@ func TestZMQSubscriber_ShortSequenceFrameSkipped(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// If we reach here without a panic, the short frame was correctly skipped.
+	subManager.Shutdown(ctx)
+}
+
+// ephemeralPort returns an available TCP port on localhost.
+func ephemeralPort(t *testing.T) string {
+	t.Helper()
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	ln.Close()
+	return fmt.Sprintf("tcp://%s", addr)
+}
+
+// seqFrame encodes a uint64 as an 8-byte big-endian frame.
+func seqFrame(seq uint64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, seq)
+	return b
+}
+
+// endSeqFrame returns the end-of-replay marker sequence.
+func endSeqFrame() []byte {
+	return seqFrame(math.MaxUint64)
+}
+
+// startMockRouter runs a ROUTER socket that serves replay requests.
+// It responds with events for sequences in [startSeq, startSeq+count),
+// then sends the end-of-replay marker.
+func startMockRouter(t *testing.T, ctx context.Context, endpoint string,
+	payloadFn func() []byte, replayCount int,
+) *atomic.Int32 {
+	t.Helper()
+	received := &atomic.Int32{}
+	topic := "kv@10.0.0.1@TestModel"
+
+	router := zmq4.NewRouter(ctx)
+	require.NoError(t, router.Listen(endpoint))
+	t.Cleanup(func() { router.Close() })
+
+	go func() {
+		for {
+			msg, err := router.Recv()
+			if err != nil {
+				return
+			}
+			received.Add(1)
+
+			// ROUTER receives [clientID, empty, startSeqBytes]
+			frames := msg.Frames
+			if len(frames) != 3 {
+				continue
+			}
+			clientID := frames[0]
+			startSeqBytes := frames[2]
+			startSeq := binary.BigEndian.Uint64(startSeqBytes)
+
+			for i := range replayCount {
+				seq := startSeq + uint64(i) // #nosec G115 -- test data, i is small
+				err := router.Send(zmq4.NewMsgFrom(
+					clientID, []byte{}, []byte(topic), seqFrame(seq), payloadFn(),
+				))
+				if err != nil {
+					return
+				}
+			}
+			if err := router.Send(zmq4.NewMsgFrom(
+				clientID, []byte{}, []byte{}, endSeqFrame(), []byte{},
+			)); err != nil {
+				return
+			}
+		}
+	}()
+
+	return received
+}
+
+// TestZMQSubscriber_ReplayOnGap verifies that when a sequence gap is detected,
+// the subscriber requests replay and processes the missing events.
+func TestZMQSubscriber_ReplayOnGap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	index, err := kvblock.NewIndex(ctx, kvblock.DefaultIndexConfig())
+	require.NoError(t, err)
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool.Start(ctx)
+
+	pubEndpoint := ephemeralPort(t)
+	replayEndpoint := ephemeralPort(t)
+
+	topic := "kv@10.0.0.1@TestModel"
+	payload := buildEventBatchPayload(t)
+
+	// Start mock ROUTER that serves 4 replay events (seq 1-4).
+	replayRequests := startMockRouter(t, ctx, replayEndpoint,
+		func() []byte { return payload }, 4)
+
+	time.Sleep(50 * time.Millisecond)
+
+	subManager := kvevents.NewSubscriberManager(pool)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", pubEndpoint, replayEndpoint, "kv@", false)
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+
+	pub := zmq4.NewPub(ctx)
+	defer pub.Close()
+	require.NoError(t, pub.Dial(pubEndpoint))
+	time.Sleep(100 * time.Millisecond)
+
+	// Proactive replay fires on connect (hasLastSeq=false).
+	time.Sleep(500 * time.Millisecond)
+	proactiveReplays := replayRequests.Load()
+	assert.Equal(t, int32(1), proactiveReplays, "proactive replay on connect expected")
+
+	// Send seq 0 — already covered by proactive replay, no gap.
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(0), payload)))
+	time.Sleep(200 * time.Millisecond)
+
+	// Send seq 5 — gap from lastSeq (set by proactive replay). Triggers another replay.
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(5), payload)))
+	time.Sleep(500 * time.Millisecond)
+
+	assert.Equal(t, int32(2), replayRequests.Load(), "proactive + gap replay expected")
+
+	subManager.Shutdown(ctx)
+}
+
+// TestZMQSubscriber_ProactiveReplayOnConnect verifies that replay fires
+// immediately on subscriber connect, without waiting for a live event.
+func TestZMQSubscriber_ProactiveReplayOnConnect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	index, err := kvblock.NewIndex(ctx, kvblock.DefaultIndexConfig())
+	require.NoError(t, err)
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool.Start(ctx)
+
+	pubEndpoint := ephemeralPort(t)
+	replayEndpoint := ephemeralPort(t)
+
+	payload := buildEventBatchPayload(t)
+
+	replayRequests := startMockRouter(t, ctx, replayEndpoint,
+		func() []byte { return payload }, 5)
+
+	time.Sleep(50 * time.Millisecond)
+
+	subManager := kvevents.NewSubscriberManager(pool)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", pubEndpoint, replayEndpoint, "kv@", false)
+	require.NoError(t, err)
+
+	// No live events sent — proactive replay should fire on connect alone.
+	time.Sleep(500 * time.Millisecond)
+
+	assert.Equal(t, int32(1), replayRequests.Load(),
+		"proactive replay should fire on connect without live events")
+
+	subManager.Shutdown(ctx)
+}
+
+// TestZMQSubscriber_SuccessfulReplayDoesNotBlockNextGap verifies that a
+// successful replay does not trigger a cooldown, so a subsequent gap is
+// replayed immediately.
+func TestZMQSubscriber_SuccessfulReplayDoesNotBlockNextGap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	index, err := kvblock.NewIndex(ctx, kvblock.DefaultIndexConfig())
+	require.NoError(t, err)
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool.Start(ctx)
+
+	pubEndpoint := ephemeralPort(t)
+	replayEndpoint := ephemeralPort(t)
+
+	topic := "kv@10.0.0.1@TestModel"
+	payload := buildEventBatchPayload(t)
+
+	replayRequests := startMockRouter(t, ctx, replayEndpoint,
+		func() []byte { return payload }, 3)
+
+	time.Sleep(50 * time.Millisecond)
+
+	subManager := kvevents.NewSubscriberManager(pool)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", pubEndpoint, replayEndpoint, "kv@", false)
+	require.NoError(t, err)
+
+	// Wait for proactive replay.
+	time.Sleep(500 * time.Millisecond)
+	assert.Equal(t, int32(1), replayRequests.Load(), "proactive replay expected")
+
+	pub := zmq4.NewPub(ctx)
+	defer pub.Close()
+	require.NoError(t, pub.Dial(pubEndpoint))
+	time.Sleep(100 * time.Millisecond)
+
+	// Send seq 10 — gap from proactive replay's lastSeq. Should trigger
+	// immediately despite proactive replay just succeeding (no failure cooldown).
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(10), payload)))
+	time.Sleep(500 * time.Millisecond)
+
+	assert.Equal(t, int32(2), replayRequests.Load(),
+		"successful replay should not block subsequent gap replay")
+
+	subManager.Shutdown(ctx)
+}
+
+// TestZMQSubscriber_ReplayDisabled verifies that with an empty replay endpoint,
+// gaps are not replayed and no panic occurs.
+func TestZMQSubscriber_ReplayDisabled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	index, err := kvblock.NewIndex(ctx, kvblock.DefaultIndexConfig())
+	require.NoError(t, err)
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool.Start(ctx)
+
+	pubEndpoint := ephemeralPort(t)
+
+	subManager := kvevents.NewSubscriberManager(pool)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", pubEndpoint, "", "kv@", false)
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+
+	pub := zmq4.NewPub(ctx)
+	defer pub.Close()
+	require.NoError(t, pub.Dial(pubEndpoint))
+	time.Sleep(100 * time.Millisecond)
+
+	topic := "kv@10.0.0.1@TestModel"
+	payload := buildEventBatchPayload(t)
+
+	// Send seq 0, then seq 5 — gap exists but replay is disabled.
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(0), payload)))
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(5), payload)))
+	time.Sleep(200 * time.Millisecond)
+
+	// No panic, no hang — test passes if we reach here.
+	subManager.Shutdown(ctx)
+}
+
+// TestZMQSubscriber_ReplayDoesNotCauseSpuriousReReplay verifies that when
+// replay returns events beyond the gap-triggering sequence, subsequent live
+// events do not trigger another replay.
+func TestZMQSubscriber_ReplayDoesNotCauseSpuriousReReplay(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	index, err := kvblock.NewIndex(ctx, kvblock.DefaultIndexConfig())
+	require.NoError(t, err)
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool.Start(ctx)
+
+	pubEndpoint := ephemeralPort(t)
+	replayEndpoint := ephemeralPort(t)
+
+	topic := "kv@10.0.0.1@TestModel"
+	payload := buildEventBatchPayload(t)
+
+	// Mock ROUTER returns 100 events (seq 1-100) on replay request.
+	replayRequests := startMockRouter(t, ctx, replayEndpoint,
+		func() []byte { return payload }, 100)
+
+	time.Sleep(50 * time.Millisecond)
+
+	subManager := kvevents.NewSubscriberManager(pool)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", pubEndpoint, replayEndpoint, "kv@", false)
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+
+	pub := zmq4.NewPub(ctx)
+	defer pub.Close()
+	require.NoError(t, pub.Dial(pubEndpoint))
+	time.Sleep(100 * time.Millisecond)
+
+	// seq 0 — establishes lastSeq.
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(0), payload)))
+	time.Sleep(200 * time.Millisecond)
+
+	// seq 5 — gap triggers replay. Replay returns seq 1-100.
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(5), payload)))
+	time.Sleep(500 * time.Millisecond)
+
+	assert.Equal(t, int32(1), replayRequests.Load(), "first gap should trigger one replay")
+
+	// seq 50 — already covered by replay. No second replay should occur.
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(50), payload)))
+	time.Sleep(300 * time.Millisecond)
+
+	assert.Equal(t, int32(1), replayRequests.Load(), "seq covered by prior replay must not trigger re-replay")
+
 	subManager.Shutdown(ctx)
 }

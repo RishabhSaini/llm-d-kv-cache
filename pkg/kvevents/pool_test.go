@@ -1105,3 +1105,111 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 	require.NoError(t, c.Write(&m))
 	return m.GetCounter().GetValue()
 }
+
+func TestEffectiveReplayPort(t *testing.T) {
+	tests := []struct {
+		name       string
+		socketPort int
+		replayPort int
+		want       int
+	}{
+		{"disabled by default", 5556, 0, -1},
+		{"explicit value", 5556, 6000, 6000},
+		{"negative disabled", 5556, -1, -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &PodDiscoveryConfig{
+				SocketPort:       tt.socketPort,
+				ReplaySocketPort: tt.replayPort,
+			}
+			assert.Equal(t, tt.want, cfg.EffectiveReplayPort())
+		})
+	}
+}
+
+// TestBlockStored_MissingParentCascadingChain verifies that when block B's
+// parent A is not in the index, B is indexed with EmptyBlockHash as parent,
+// and a subsequent block C referencing B chains correctly without being dropped.
+func TestBlockStored_MissingParentCascadingChain(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, _ := newTestPool(t, 16)
+
+	tokensB := makeTokens(32)
+	engineKeysB := makeEngineKeys(2, 2000)
+
+	batchB := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeysB,
+				Tokens:      tokensB,
+				ParentHash:  888888,
+			},
+		},
+	}
+	pool.processEventBatch(ctx, batchB, "pod-chain", "test-model")
+
+	lastEngineKeyB := kvblock.BlockHash(engineKeysB[len(engineKeysB)-1])
+	parentKeyForC, err := idx.GetRequestKey(ctx, lastEngineKeyB)
+	require.NoError(t, err, "block B should be resolvable")
+
+	tokensC := makeTokens(32)
+	engineKeysC := makeEngineKeys(2, 3000)
+
+	batchC := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeysC,
+				Tokens:      tokensC,
+				ParentHash:  uint64(lastEngineKeyB),
+			},
+		},
+	}
+	pool.processEventBatch(ctx, batchC, "pod-chain", "test-model")
+
+	for _, ek := range engineKeysC {
+		reqKey, err := idx.GetRequestKey(ctx, kvblock.BlockHash(ek))
+		require.NoError(t, err, "block C engine key %d should be resolvable", ek)
+		assert.NotEqual(t, kvblock.EmptyBlockHash, reqKey)
+		assert.NotEqual(t, parentKeyForC, reqKey, "block C key should differ from block B key")
+	}
+}
+
+// TestBlockStored_MissingParentDoesNotAffectBatch verifies that a missing
+// parent in one event does not prevent other events in the same batch from
+// being processed.
+func TestBlockStored_MissingParentDoesNotAffectBatch(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, _ := newTestPool(t, 16)
+
+	tokensGood := makeTokens(32)
+	engineKeysGood := makeEngineKeys(2, 4000)
+
+	tokensBad := makeTokens(32)
+	engineKeysBad := makeEngineKeys(2, 5000)
+
+	batch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeysBad,
+				Tokens:      tokensBad,
+				ParentHash:  777777,
+			},
+			&BlockStoredEvent{
+				BlockHashes: engineKeysGood,
+				Tokens:      tokensGood,
+				ParentHash:  0,
+			},
+		},
+	}
+	pool.processEventBatch(ctx, batch, "pod-batch", "test-model")
+
+	for _, ek := range engineKeysGood {
+		_, err := idx.GetRequestKey(ctx, kvblock.BlockHash(ek))
+		require.NoError(t, err, "good event engine key %d should be resolvable", ek)
+	}
+	for _, ek := range engineKeysBad {
+		_, err := idx.GetRequestKey(ctx, kvblock.BlockHash(ek))
+		require.NoError(t, err, "bad-parent event engine key %d should still be resolvable", ek)
+	}
+}

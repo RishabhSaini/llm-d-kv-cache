@@ -64,7 +64,7 @@ func main() {
 	// is synchronous unlike C libzmq's non-blocking zmq_connect.)
 	const publisherEndpoint = "tcp://localhost:5557"
 	subManager := kvevents.NewSubscriberManager(eventsPool)
-	if err := subManager.EnsureSubscriber(ctx, "local-sim", publisherEndpoint, "kv@", false); err != nil {
+	if err := subManager.EnsureSubscriber(ctx, "local-sim", publisherEndpoint, "", "kv@", false); err != nil {
 		logger.Error(err, "failed to start local subscriber")
 		return
 	}

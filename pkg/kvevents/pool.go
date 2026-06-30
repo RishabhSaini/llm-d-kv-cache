@@ -77,6 +77,18 @@ type PodDiscoveryConfig struct {
 	// The reconciler will connect to tcp://<PodIP>:<SocketPort>
 	// Default: 5557
 	SocketPort int `json:"socketPort"`
+	// ReplaySocketPort is the port where vLLM pods expose their ZMQ ROUTER
+	// socket for replay requests. Disabled when not set (0 or negative).
+	ReplaySocketPort int `json:"replaySocketPort,omitempty"`
+}
+
+// EffectiveReplayPort returns the replay socket port.
+// Returns -1 (disabled) when not explicitly configured.
+func (c *PodDiscoveryConfig) EffectiveReplayPort() int {
+	if c.ReplaySocketPort <= 0 {
+		return -1
+	}
+	return c.ReplaySocketPort
 }
 
 // DefaultPodReconcilerConfig returns a default configuration for the pod reconciler.
@@ -377,11 +389,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				parentEngineKey := kvblock.BlockHash(ev.ParentHash)
 				key, err := p.index.GetRequestKey(ctx, parentEngineKey)
 				if err != nil {
-					debugLogger.Error(err, "Failed to get request key for parent block",
+					debugLogger.Info("Parent block not in index, using empty parent hash",
 						"parentEngineKey", parentEngineKey, "effectiveModelName", effectiveModelName)
-					continue
+				} else {
+					parentRequestKey = key
 				}
-				parentRequestKey = key
 			}
 
 			var extraFeatures []*kvblock.BlockExtraFeatures
