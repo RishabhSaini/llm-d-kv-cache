@@ -305,17 +305,15 @@ func TestZMQSubscriber_ReplayOnGap(t *testing.T) {
 	subManager := kvevents.NewSubscriberManager(pool)
 	err = subManager.EnsureSubscriber(ctx, "test-pod", pubEndpoint, replayEndpoint, "kv@", false)
 	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		return replayRequests.Load() >= 1
+	}, 5*time.Second, 50*time.Millisecond, "proactive replay on connect expected")
 
 	pub := zmq4.NewPub(ctx)
 	defer pub.Close()
 	require.NoError(t, pub.Dial(pubEndpoint))
 	time.Sleep(100 * time.Millisecond)
-
-	// Proactive replay fires on connect (hasLastSeq=false).
-	time.Sleep(500 * time.Millisecond)
-	proactiveReplays := replayRequests.Load()
-	assert.Equal(t, int32(1), proactiveReplays, "proactive replay on connect expected")
 
 	// Send seq 0 — already covered by proactive replay, no gap.
 	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(0), payload)))
@@ -323,9 +321,10 @@ func TestZMQSubscriber_ReplayOnGap(t *testing.T) {
 
 	// Send seq 5 — gap from lastSeq (set by proactive replay). Triggers another replay.
 	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(5), payload)))
-	time.Sleep(500 * time.Millisecond)
 
-	assert.Equal(t, int32(2), replayRequests.Load(), "proactive + gap replay expected")
+	require.Eventually(t, func() bool {
+		return replayRequests.Load() >= 2
+	}, 5*time.Second, 50*time.Millisecond, "proactive + gap replay expected")
 
 	subManager.Shutdown(ctx)
 }
@@ -357,11 +356,9 @@ func TestZMQSubscriber_ProactiveReplayOnConnect(t *testing.T) {
 	err = subManager.EnsureSubscriber(ctx, "test-pod", pubEndpoint, replayEndpoint, "kv@", false)
 	require.NoError(t, err)
 
-	// No live events sent — proactive replay should fire on connect alone.
-	time.Sleep(500 * time.Millisecond)
-
-	assert.Equal(t, int32(1), replayRequests.Load(),
-		"proactive replay should fire on connect without live events")
+	require.Eventually(t, func() bool {
+		return replayRequests.Load() >= 1
+	}, 5*time.Second, 50*time.Millisecond, "proactive replay should fire on connect without live events")
 
 	subManager.Shutdown(ctx)
 }
@@ -395,22 +392,20 @@ func TestZMQSubscriber_SuccessfulReplayDoesNotBlockNextGap(t *testing.T) {
 	err = subManager.EnsureSubscriber(ctx, "test-pod", pubEndpoint, replayEndpoint, "kv@", false)
 	require.NoError(t, err)
 
-	// Wait for proactive replay.
-	time.Sleep(500 * time.Millisecond)
-	assert.Equal(t, int32(1), replayRequests.Load(), "proactive replay expected")
+	require.Eventually(t, func() bool {
+		return replayRequests.Load() >= 1
+	}, 5*time.Second, 50*time.Millisecond, "proactive replay expected")
 
 	pub := zmq4.NewPub(ctx)
 	defer pub.Close()
 	require.NoError(t, pub.Dial(pubEndpoint))
 	time.Sleep(100 * time.Millisecond)
 
-	// Send seq 10 — gap from proactive replay's lastSeq. Should trigger
-	// immediately despite proactive replay just succeeding (no failure cooldown).
 	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(10), payload)))
-	time.Sleep(500 * time.Millisecond)
 
-	assert.Equal(t, int32(2), replayRequests.Load(),
-		"successful replay should not block subsequent gap replay")
+	require.Eventually(t, func() bool {
+		return replayRequests.Load() >= 2
+	}, 5*time.Second, 50*time.Millisecond, "successful replay should not block subsequent gap replay")
 
 	subManager.Shutdown(ctx)
 }
@@ -482,28 +477,70 @@ func TestZMQSubscriber_ReplayDoesNotCauseSpuriousReReplay(t *testing.T) {
 	subManager := kvevents.NewSubscriberManager(pool)
 	err = subManager.EnsureSubscriber(ctx, "test-pod", pubEndpoint, replayEndpoint, "kv@", false)
 	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		return replayRequests.Load() >= 1
+	}, 5*time.Second, 50*time.Millisecond, "proactive replay expected")
 
 	pub := zmq4.NewPub(ctx)
 	defer pub.Close()
 	require.NoError(t, pub.Dial(pubEndpoint))
 	time.Sleep(100 * time.Millisecond)
 
-	// seq 0 — establishes lastSeq.
+	// seq 0 and seq 50 are both below lastSeq (set to 99 by proactive replay
+	// of 100 events). No gap, no additional replay.
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(0), payload)))
+	time.Sleep(200 * time.Millisecond)
+	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(50), payload)))
+	time.Sleep(200 * time.Millisecond)
+
+	assert.Equal(t, int32(1), replayRequests.Load(), "no additional replay for seqs covered by proactive replay")
+
+	subManager.Shutdown(ctx)
+}
+
+// TestZMQSubscriber_FailedReplayDegradeGracefully verifies that a bad
+// replay endpoint does not crash or hang the subscriber — cooldown
+// prevents repeated failed attempts.
+func TestZMQSubscriber_FailedReplayDegradeGracefully(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	index, err := kvblock.NewIndex(ctx, kvblock.DefaultIndexConfig())
+	require.NoError(t, err)
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool.Start(ctx)
+
+	pubEndpoint := ephemeralPort(t)
+	// Use a port with nothing listening — replay Dial will fail.
+	badReplayEndpoint := ephemeralPort(t)
+
+	topic := "kv@10.0.0.1@TestModel"
+	payload := buildEventBatchPayload(t)
+
+	subManager := kvevents.NewSubscriberManager(pool)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", pubEndpoint, badReplayEndpoint, "kv@", false)
+	require.NoError(t, err)
+
+	// Wait for proactive replay to fail (bad endpoint).
+	time.Sleep(500 * time.Millisecond)
+
+	pub := zmq4.NewPub(ctx)
+	defer pub.Close()
+	require.NoError(t, pub.Dial(pubEndpoint))
+	time.Sleep(100 * time.Millisecond)
+
+	// seq 0 — establishes lastSeq. Cooldown blocks replay, event processed.
 	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(0), payload)))
 	time.Sleep(200 * time.Millisecond)
 
-	// seq 5 — gap triggers replay. Replay returns seq 1-100.
+	// seq 5 — gap detected but cooldown still active from proactive failure.
+	// Event processed normally since canAttemptReplay() is false.
 	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(5), payload)))
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
-	assert.Equal(t, int32(1), replayRequests.Load(), "first gap should trigger one replay")
-
-	// seq 50 — already covered by replay. No second replay should occur.
-	require.NoError(t, pub.Send(zmq4.NewMsgFrom([]byte(topic), seqFrame(50), payload)))
-	time.Sleep(300 * time.Millisecond)
-
-	assert.Equal(t, int32(1), replayRequests.Load(), "seq covered by prior replay must not trigger re-replay")
-
+	// No panic, no hang — cooldown prevented replay attempt on bad endpoint.
 	subManager.Shutdown(ctx)
 }

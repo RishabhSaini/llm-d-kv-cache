@@ -389,11 +389,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				parentEngineKey := kvblock.BlockHash(ev.ParentHash)
 				key, err := p.index.GetRequestKey(ctx, parentEngineKey)
 				if err != nil {
-					debugLogger.Info("Parent block not in index, using empty parent hash",
+					debugLogger.Error(err, "Failed to get request key for parent block",
 						"parentEngineKey", parentEngineKey, "effectiveModelName", effectiveModelName)
-				} else {
-					parentRequestKey = key
+					continue
 				}
+				parentRequestKey = key
 			}
 
 			var extraFeatures []*kvblock.BlockExtraFeatures
